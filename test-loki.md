@@ -7,6 +7,7 @@ def generate():
 client = genai.Client(
 vertexai=True,
 api_key=os.environ.get("GOOGLE_CLOUD_API_KEY"),
+
 )
 
 text1 = types.Part.from_text(text="""Analyze https://futransolutions.com/ and generate the sales intelligence report.
