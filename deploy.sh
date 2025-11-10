@@ -11,6 +11,10 @@ SERVICE_NAME="sales-intelligence-api"
 REGION="us-central1"
 IMAGE_NAME="gcr.io/${PROJECT_ID}/${SERVICE_NAME}"
 
+# API Key (set this or use --set-env-vars during deployment)
+# Generate new key with: python3 -c "import secrets; print(secrets.token_urlsafe(32))"
+API_KEY="${API_KEY:-x5ZK8PmzIFIZa79bMOaLHNuhgDf7-1HdJ4sUwSs9laA}"
+
 echo "🚀 Deploying Sales Intelligence API to Cloud Run..."
 echo "Project: ${PROJECT_ID}"
 echo "Service: ${SERVICE_NAME}"
@@ -37,7 +41,7 @@ gcloud run deploy ${SERVICE_NAME} \
   --timeout 600 \
   --max-instances 10 \
   --min-instances 0 \
-  --set-env-vars "PROJECT_ID=${PROJECT_ID}"
+  --set-env-vars "PROJECT_ID=${PROJECT_ID},API_KEY=${API_KEY}"
 
 # Get the service URL
 echo ""

@@ -1,4 +1,5 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Security, Depends, status
+from fastapi.security import APIKeyHeader
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, HttpUrl, Field
 from google import genai
@@ -12,6 +13,47 @@ import logging
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# API Key configuration
+API_KEY = "x5ZK8PmzIFIZa79bMOaLHNuhgDf7-1HdJ4sUwSs9laA"  # Load from environment variable
+if not API_KEY:
+    logger.warning("⚠️  API_KEY not set! All requests will be rejected.")
+
+api_key_header = APIKeyHeader(name="X-API-KEY", auto_error=False)
+
+async def verify_api_key(api_key: str = Security(api_key_header)) -> str:
+    """
+    Verify the API key from X-API-KEY header.
+    
+    Args:
+        api_key: API key from request header
+        
+    Returns:
+        str: Validated API key
+        
+    Raises:
+        HTTPException: If API key is invalid or missing
+    """
+    if not API_KEY:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="API key not configured on server"
+        )
+    
+    if not api_key:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing X-API-KEY header"
+        )
+    
+    if api_key != API_KEY:
+        logger.warning(f"Invalid API key attempt from request")
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Invalid API key"
+        )
+    
+    return api_key
 
 # Initialize FastAPI app
 app = FastAPI(
@@ -55,17 +97,22 @@ class CompanyAnalysisResponse(BaseModel):
 
 @app.get("/")
 async def root():
-    """Health check endpoint."""
+    """Public endpoint - service information."""
     return {
-        "status": "healthy",
         "service": "Sales Intelligence API",
-        "version": "1.0.0"
+        "version": "1.0.0",
+        "status": "online",
+        "docs": "/docs",
+        "authentication": "Required - X-API-KEY header"
     }
 
 @app.get("/health")
 async def health_check():
-    """Health check endpoint for Cloud Run."""
-    return {"status": "healthy"}
+    """Health check endpoint for Cloud Run (public, no auth required)."""
+    return {
+        "status": "healthy",
+        "api_key_configured": bool(API_KEY)
+    }
 
 async def generate_sales_intelligence(
     company_name: str,
@@ -591,12 +638,18 @@ This is an example of a single, well-formed object within the `outreach_ideas` a
         raise
 
 @app.post("/api/v1/analyze", response_model=CompanyAnalysisResponse)
-async def analyze_company(request: CompanyAnalysisRequest):
+async def analyze_company(
+    request: CompanyAnalysisRequest,
+    api_key: str = Depends(verify_api_key)
+):
     """
     Generate sales intelligence report for a company.
     
+    **Authentication Required**: Include `X-API-KEY` header with valid API key.
+    
     Args:
         request: Company analysis request with name, website, and optional LinkedIn URL
+        api_key: Validated API key (automatically injected)
         
     Returns:
         CompanyAnalysisResponse: Generated sales intelligence report
