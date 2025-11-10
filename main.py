@@ -1,24 +1,111 @@
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, HttpUrl, Field
 from google import genai
 from google.genai import types
-
-import base64
+from typing import Optional
 import os
-def generate():
+from datetime import datetime
+import json
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Initialize FastAPI app
+app = FastAPI(
+    title="Sales Intelligence API",
+    description="Generate sales intelligence reports using Google Gemini",
+    version="1.0.0"
+)
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Request model
+class CompanyAnalysisRequest(BaseModel):
+    """Request model for company analysis."""
+    company_name: str = Field(..., description="Name of the company to analyze")
+    company_website: HttpUrl = Field(..., description="Company website URL")
+    company_linkedin: Optional[HttpUrl] = Field(None, description="Company LinkedIn URL")
     
-  client = genai.Client(
-      vertexai=True,
-      location="global",
-      project="wyra-477511"
-  )
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "company_name": "Futran Solutions",
+                "company_website": "https://futransolutions.com/",
+                "company_linkedin": "https://www.linkedin.com/company/futransolutionsinc/"
+            }
+        }
 
-  text1 = types.Part.from_text(text="""Analyze https://futransolutions.com/ and generate the sales intelligence report.
+# Response model
+class CompanyAnalysisResponse(BaseModel):
+    """Response model for company analysis."""
+    status: str
+    data: Optional[dict] = None
+    error: Optional[str] = None
+    tokens_used: Optional[int] = None
 
-Company Name: Futran Solutions
-Company LinkedIn: https://www.linkedin.com/company/futransolutionsinc/
-Analysis Date: November 10, 2025
+@app.get("/")
+async def root():
+    """Health check endpoint."""
+    return {
+        "status": "healthy",
+        "service": "Sales Intelligence API",
+        "version": "1.0.0"
+    }
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint for Cloud Run."""
+    return {"status": "healthy"}
+
+async def generate_sales_intelligence(
+    company_name: str,
+    company_website: str,
+    company_linkedin: Optional[str] = None
+) -> dict:
+    """
+    Generate sales intelligence report for a company.
+    
+    Args:
+        company_name: Name of the company
+        company_website: Company website URL
+        company_linkedin: Optional LinkedIn URL
+        
+    Returns:
+        dict: Sales intelligence report
+        
+    Raises:
+        Exception: If generation fails
+    """
+    try:
+        client = genai.Client(
+            vertexai=True,
+            location="global",
+            project="wyra-477511"
+        )
+        
+        current_date = datetime.now().strftime("%B %d, %Y")
+        
+        # Build the analysis prompt
+        linkedin_text = f"\nCompany LinkedIn: {company_linkedin}" if company_linkedin else ""
+        
+        text1 = types.Part.from_text(text=f"""Analyze {company_website} and generate the sales intelligence report.
+
+Company Name: {company_name}{linkedin_text}
+Analysis Date: {current_date}
 
 Return valid JSON only - no markdown or code blocks.""")
-  si_text1 = """# ROLE & PERSPECTIVE
+        
+        si_text1 = """# ROLE & PERSPECTIVE
 You are a sales intelligence analyst generating a comprehensive report ABOUT a technology company FOR that company's leadership (sales, marketing, executives). Write from a third-person analytical perspective: \"This company...\", \"They should target...\", \"Their strengths include...\".
 
 # TASK
@@ -375,51 +462,170 @@ This is an example of a single, well-formed object within the `outreach_ideas` a
     }
   }
 }"""
+        
+        model = "gemini-2.5-flash-preview-09-2025"
+        contents = [
+            types.Content(
+                role="user",
+                parts=[text1]
+            )
+        ]
+        tools = [
+            types.Tool(google_search=types.GoogleSearch()),
+        ]
+        
+        generate_content_config = types.GenerateContentConfig(
+            temperature=0.3,
+            top_p=0.85,
+            max_output_tokens=65535,
+            safety_settings=[
+                types.SafetySetting(
+                    category="HARM_CATEGORY_HATE_SPEECH",
+                    threshold="OFF"
+                ),
+                types.SafetySetting(
+                    category="HARM_CATEGORY_DANGEROUS_CONTENT",
+                    threshold="OFF"
+                ),
+                types.SafetySetting(
+                    category="HARM_CATEGORY_SEXUALLY_EXPLICIT",
+                    threshold="OFF"
+                ),
+                types.SafetySetting(
+                    category="HARM_CATEGORY_HARASSMENT",
+                    threshold="OFF"
+                )
+            ],
+            tools=tools,
+            system_instruction=[types.Part.from_text(text=si_text1)],
+            thinking_config=types.ThinkingConfig(
+                thinking_budget=-1,
+            ),
+        )
+        
+        # Collect the full response from streaming
+        full_response = ""
+        chunk_count = 0
+        
+        logger.info("Starting to collect streaming response...")
+        
+        for chunk in client.models.generate_content_stream(
+            model=model,
+            contents=contents,
+            config=generate_content_config,
+        ):
+            if not chunk.candidates:
+                continue
+                
+            candidate = chunk.candidates[0]
+            
+            # Skip chunks without content
+            if not candidate.content or not candidate.content.parts:
+                continue
+            
+            # Get text from chunk
+            chunk_text = chunk.text if hasattr(chunk, 'text') and chunk.text else ""
+            if chunk_text:
+                full_response += chunk_text
+                chunk_count += 1
+            
+            # Log finish reason if present
+            if hasattr(candidate, 'finish_reason') and candidate.finish_reason:
+                logger.info(f"Stream finished with reason: {candidate.finish_reason}")
+        
+        logger.info(f"Collected {chunk_count} chunks, total length: {len(full_response)} characters")
+        
+        # Check if we got any response
+        if not full_response or len(full_response.strip()) == 0:
+            logger.error("Empty response received from AI")
+            raise Exception("Empty response received from AI model")
+        
+        # Parse JSON response
+        try:
+            # Clean the response - remove markdown code blocks if present
+            cleaned_response = full_response.strip()
+            
+            logger.debug(f"Response starts with: {cleaned_response[:100]}")
+            
+            # Remove ```json at the start
+            if cleaned_response.startswith("```json"):
+                cleaned_response = cleaned_response[7:]  # Remove ```json
+                logger.debug("Removed ```json markdown prefix")
+            elif cleaned_response.startswith("```"):
+                cleaned_response = cleaned_response[3:]  # Remove ```
+                logger.debug("Removed ``` markdown prefix")
+            
+            # Remove ``` at the end
+            if cleaned_response.endswith("```"):
+                cleaned_response = cleaned_response[:-3]
+                logger.debug("Removed ``` markdown suffix")
+            
+            # Strip again after removing markdown
+            cleaned_response = cleaned_response.strip()
+            
+            logger.debug(f"Cleaned response starts with: {cleaned_response[:100]}")
+            logger.debug(f"Cleaned response ends with: {cleaned_response[-100:]}")
+            
+            # Parse the JSON
+            result = json.loads(cleaned_response)
+            logger.info("Successfully parsed JSON response")
+            return result
+            
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse JSON response: {e}")
+            logger.error(f"Raw response (first 1000 chars): {full_response[:1000]}")
+            logger.error(f"Raw response (last 500 chars): {full_response[-500:]}")
+            if 'cleaned_response' in locals():
+                logger.error(f"Cleaned response (first 1000 chars): {cleaned_response[:1000]}")
+                logger.error(f"Cleaned response (last 500 chars): {cleaned_response[-500:]}")
+            
+            # Save full response to file for debugging
+            with open("/tmp/failed_response.txt", "w") as f:
+                f.write(full_response)
+            logger.error("Full response saved to /tmp/failed_response.txt")
+            
+            raise Exception(f"Invalid JSON response from AI: {str(e)}")
+            
+    except Exception as e:
+        logger.error(f"Error generating sales intelligence: {str(e)}")
+        raise
 
-  model = "gemini-2.5-flash-preview-09-2025"
-  contents = [
-    types.Content(
-      role="user",
-      parts=[
-        text1
-      ]
-    )
-  ]
-  tools = [
-    types.Tool(google_search=types.GoogleSearch()),
-  ]
+@app.post("/api/v1/analyze", response_model=CompanyAnalysisResponse)
+async def analyze_company(request: CompanyAnalysisRequest):
+    """
+    Generate sales intelligence report for a company.
+    
+    Args:
+        request: Company analysis request with name, website, and optional LinkedIn URL
+        
+    Returns:
+        CompanyAnalysisResponse: Generated sales intelligence report
+    """
+    try:
+        logger.info(f"Starting analysis for {request.company_name}")
+        
+        result = await generate_sales_intelligence(
+            company_name=request.company_name,
+            company_website=str(request.company_website),
+            company_linkedin=str(request.company_linkedin) if request.company_linkedin else None
+        )
+        
+        logger.info(f"Successfully completed analysis for {request.company_name}")
+        
+        return CompanyAnalysisResponse(
+            status="success",
+            data=result,
+            tokens_used=None  # Can be added if you want to track usage
+        )
+        
+    except Exception as e:
+        logger.error(f"Analysis failed for {request.company_name}: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Analysis failed: {str(e)}"
+        )
 
-  generate_content_config = types.GenerateContentConfig(
-    temperature = 0.3,
-    top_p = 0.85,
-    max_output_tokens = 65535,
-    safety_settings = [types.SafetySetting(
-      category="HARM_CATEGORY_HATE_SPEECH",
-      threshold="OFF"
-    ),types.SafetySetting(
-      category="HARM_CATEGORY_DANGEROUS_CONTENT",
-      threshold="OFF"
-    ),types.SafetySetting(
-      category="HARM_CATEGORY_SEXUALLY_EXPLICIT",
-      threshold="OFF"
-    ),types.SafetySetting(
-      category="HARM_CATEGORY_HARASSMENT",
-      threshold="OFF"
-    )],
-    tools = tools,
-    system_instruction=[types.Part.from_text(text=si_text1)],
-    thinking_config=types.ThinkingConfig(
-      thinking_budget=-1,
-    ),
-  )
-
-  for chunk in client.models.generate_content_stream(
-    model = model,
-    contents = contents,
-    config = generate_content_config,
-    ):
-    if not chunk.candidates or not chunk.candidates[0].content or not chunk.candidates[0].content.parts:
-        continue
-    print(chunk.text, end="")
-
-generate()
+# For local testing
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8080)
